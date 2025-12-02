@@ -1,0 +1,22 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python
+__pycache__/
+*.pyc
+
+# VSCode
+.vscode/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Streamlit cache
+.streamlit/
+
+# Build artifacts
+*.log
+*.tmp
