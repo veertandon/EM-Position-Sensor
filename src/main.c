@@ -1,55 +1,55 @@
 #include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_vfs_dev.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <math.h>
-#include <stdio.h>
 
 #define SIMULATION_MODE 0 // 1 = no hardware, use simulated values; 0 = real sensor
 
-// --- LDC1612 Register Addresses ---
-#define REG_DATA_CH1_MSB        0x02
-#define REG_DATA_CH1_LSB        0x03
-#define REG_RCOUNT_CH1          0x09  // Reference Count setting for Channel 1
-#define REG_SETTLECOUNT_CH1     0x11  // Channel 1 Settling Reference Count
-#define REG_CLOCK_DIVIDERS_CH1  0x15  // Reference and Sensor Divider settings for Channel 1
-#define REG_DRIVE_CURRENT_CH1   0x1F  // Channel 1 sensor current drive configuration
-#define REG_CONFIG              0x1A  // Conversion Configuration
-#define REG_MUX_CONFIG          0x1B  // Channel Multiplexing Configuration
-#define REG_ERROR_CONFIG        0x19
+// // --- LDC1612 Register Addresses ---
+#define REG_DATA_CH1_MSB 0x02
+#define REG_DATA_CH1_LSB 0x03
+#define REG_RCOUNT_CH1 0x09         // Reference Count setting for Channel 1
+#define REG_SETTLECOUNT_CH1 0x11    // Channel 1 Settling Reference Count
+#define REG_CLOCK_DIVIDERS_CH1 0x15 // Reference and Sensor Divider settings for Channel 1
+#define REG_DRIVE_CURRENT_CH1 0x1F  // Channel 1 sensor current drive configuration
+#define REG_CONFIG 0x1A             // Conversion Configuratio
+#define REG_MUX_CONFIG 0x1B         // Channel Multiplexing Configuration
+#define REG_ERROR_CONFIG 0x19
 
 // --- I2C Master Configuration ---
-#define I2C_MASTER_SCL_IO       22
-#define I2C_MASTER_SDA_IO       21
-#define I2C_MASTER_NUM          I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ      100000
-#define LDC1612_ADDR            0x2B
+#define I2C_MASTER_SCL_IO 22
+#define I2C_MASTER_SDA_IO 21
+#define I2C_MASTER_NUM I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ 100000
+#define LDC1612_ADDR 0x2B
 
 static const char *TAG = "LDC1612_I2C";
 
 // --- Sensor/Calculation Constants ---
-#define TANK_CAPACITANCE  76e-12
-#define BASE_FREQ         4800000.0    // Hz
-#define BASE_L_VALUE      1.3642e-05   // H
-#define R_COUNT_VALUE     0xFFFF
-#define CLK_SPEED         4000000.0    // Internal LDC clock (datasheet scale factor)
+#define TANK_CAPACITANCE 76e-12
+#define BASE_FREQ 4708740       // from VNA testing
+#define BASE_L_VALUE 1.3642E-05 // from VNA testing
+#define R_COUNT_VALUE 0xFFFF
+#define CLK_SPEED 43400000 // Internal LDC clock
 
 // --- Function Prototypes ---
 esp_err_t ldc1612_i2c_write(uint8_t reg_addr, uint16_t data);
 esp_err_t ldc1612_i2c_read(uint8_t reg_addr, uint16_t *data);
-esp_err_t ldc1612_init(void);
+esp_err_t ldc1612_init();
 
-// --- Delta L Calculation (expects frequencies in Hz) ---
-double calc_delta_L(double measured_freq_hz, double base_freq_hz, double base_L)
+// --- Delta L Calculation ---
+double calc_delta_L(double measured_freq, double base_freq, double base_L)
 {
-    double delta_f = measured_freq_hz - base_freq_hz;
-    double delta_L = (delta_f * base_L * -2.0) / base_freq_hz;
+    double delta_f = measured_freq - base_freq;
+    double delta_L = (delta_f * base_L * -2.0) / base_freq;
     return delta_L;
 }
 
 // --- I2C Master Initialization ---
-void i2c_master_init(void)
+void i2c_master_init()
 {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -73,28 +73,14 @@ esp_err_t ldc1612_i2c_write(uint8_t reg_addr, uint16_t data)
     write_buf[1] = (uint8_t)(data >> 8);
     write_buf[2] = (uint8_t)(data & 0xFF);
 
-    return i2c_master_write_to_device(
-        I2C_MASTER_NUM,
-        LDC1612_ADDR,
-        write_buf,
-        3,
-        1000 / portTICK_PERIOD_MS
-    );
+    return i2c_master_write_to_device(I2C_MASTER_NUM, LDC1612_ADDR, write_buf, 3, 1000 / portTICK_PERIOD_MS);
 }
 
 // --- I2C Read Function ---
 esp_err_t ldc1612_i2c_read(uint8_t reg_addr, uint16_t *data)
 {
     uint8_t read_buf[2];
-    esp_err_t ret = i2c_master_write_read_device(
-        I2C_MASTER_NUM,
-        LDC1612_ADDR,
-        &reg_addr,
-        1,
-        read_buf,
-        2,
-        1000 / portTICK_PERIOD_MS
-    );
+    esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, LDC1612_ADDR, &reg_addr, 1, read_buf, 2, 1000 / portTICK_PERIOD_MS);
 
     if (ret == ESP_OK)
     {
@@ -104,7 +90,7 @@ esp_err_t ldc1612_i2c_read(uint8_t reg_addr, uint16_t *data)
     return ret;
 }
 
-esp_err_t ldc1612_init(void)
+esp_err_t ldc1612_init()
 {
     ESP_LOGI(TAG, "Starting LDC1612 initialization for Channel 1...");
     esp_err_t ret;
@@ -122,6 +108,8 @@ esp_err_t ldc1612_init(void)
     ESP_LOGI(TAG, "RCOUNT_CH1 set to 0x%04X", R_COUNT_VALUE);
 
     // 2. Set SETTLECOUNT for Channel 1
+    // Formula: SETTLECOUNT ≥ Q_sensor × f_REF / (16 × f_SENSOR)
+    // For safety, using 10 (0x000A) as a starting value
     uint16_t settle_val = 0x000A;
     ret = ldc1612_i2c_write(REG_SETTLECOUNT_CH1, settle_val);
     if (ret != ESP_OK)
@@ -132,7 +120,10 @@ esp_err_t ldc1612_init(void)
     ESP_LOGI(TAG, "SETTLECOUNT_CH1 set to 0x%04X", settle_val);
 
     // 3. Set CLOCK_DIVIDERS for Channel 1
-    uint16_t clk_div_val = 0x1001;  // FIN_DIVIDER1 = 1, FREF_DIVIDER1 = 1
+    // Bits [15:12] = FIN_DIVIDER1 = 0x1 (divide by 1)
+    // Bits [11:10] = Reserved = 0b00
+    // Bits [9:0] = FREF_DIVIDER1 = 0x001 (divide by 1)
+    uint16_t clk_div_val = 0x1001;
     ret = ldc1612_i2c_write(REG_CLOCK_DIVIDERS_CH1, clk_div_val);
     if (ret != ESP_OK)
     {
@@ -152,7 +143,11 @@ esp_err_t ldc1612_init(void)
     ESP_LOGI(TAG, "ERROR_CONFIG set to 0x%04X", error_config);
 
     // 5. Set MUX_CONFIG
-    uint16_t mux_val = 0x020D; // Single channel, deglitch filter 10 MHz
+    // Bit [15] = AUTOSCAN_EN = 0 (single channel continuous)
+    // Bits [14:13] = RR_SEQUENCE = 0b00 (not used in single channel)
+    // Bits [12:3] = Reserved = 0b00 0100 0001
+    // Bits [2:0] = DEGLITCH = 0b101 (10 MHz) for ~5MHz sensor
+    uint16_t mux_val = 0x020D; // Single channel, deglitch filter
     ret = ldc1612_i2c_write(REG_MUX_CONFIG, mux_val);
     if (ret != ESP_OK)
     {
@@ -161,8 +156,12 @@ esp_err_t ldc1612_init(void)
     }
     ESP_LOGI(TAG, "MUX_CONFIG set to 0x%04X", mux_val);
 
-    // 6. DRIVE_CURRENT for Channel 1
-    uint16_t drive_current = 0x9000; // IDRIVE1 ~195 µA
+    // 6. **CRITICAL** Set DRIVE_CURRENT for Channel 1
+    // For a sensor with Rp in the range of 5-10 kΩ, use IDRIVE value around 0b10010
+    // Bits [15:11] = IDRIVE1 = 0b10010 (18 decimal) ≈ 195 µA
+    // Bits [10:6] = INIT_IDRIVE1 = 0b00000 (set to 0 when writing)
+    // Bits [5:0] = Reserved = 0b00 0000
+    uint16_t drive_current = 0x3800; // IDRIVE1 = 0b10010 (18 decimal)
     ret = ldc1612_i2c_write(REG_DRIVE_CURRENT_CH1, drive_current);
     if (ret != ESP_OK)
     {
@@ -171,7 +170,17 @@ esp_err_t ldc1612_init(void)
     }
     ESP_LOGI(TAG, "DRIVE_CURRENT_CH1 set to 0x%04X", drive_current);
 
-    // 7. CONFIG: Channel 1 active, RP override, internal osc
+    // 7. Set CONFIG register LAST to select Channel 1 and wake up device
+    // Bits [15:14] = ACTIVE_CHAN = 0b01 (Channel 1 for continuous conversion)
+    // Bit [13] = SLEEP_MODE_EN = 0 (active mode)
+    // Bit [12] = RP_OVERRIDE_EN = 1 (use programmed IDRIVE)
+    // Bit [11] = SENSOR_ACTIVATE_SEL = 0 (full current activation)
+    // Bit [10] = AUTO_AMP_DIS = 1 (disable auto amplitude correction)
+    // Bit [9] = REF_CLK_SRC = 0 (internal oscillator)
+    // Bit [8] = Reserved = 0
+    // Bit [7] = INTB_DIS = 0 (INTB enabled)
+    // Bit [6] = HIGH_CURRENT_DRV = 0 (normal current)
+    // Bits [5:0] = Reserved = 0b00 0001 (must be set to this value)
     uint16_t config_val = 0x5401; // Channel 1 selected
     ret = ldc1612_i2c_write(REG_CONFIG, config_val);
     if (ret != ESP_OK)
@@ -188,42 +197,38 @@ esp_err_t ldc1612_init(void)
     return ESP_OK;
 }
 
-// ===================== LUT & INTERPOLATION =====================
-
-#define NUM_POINTS 41
-
+// Calibration
+#define NUM_POINTS 26
+// need 80 for interval, end value at 75mm
 static const float pos_mm[NUM_POINTS] = {
-    0.0, 2.5, 5.0, 7.5, 10.0,
-    12.5, 15.0, 17.5, 20.0, 22.5,
-    25.0, 27.5, 30.0, 32.5, 35.0,
+    0.0, 5.0, 10.0, 15.0, 17.5, 20.0,
+    22.5, 25.0, 27.5, 30.0, 32.5, 35.0,
     37.5, 40.0, 42.5, 45.0, 47.5,
     50.0, 52.5, 55.0, 57.5, 60.0,
-    62.5, 65.0, 67.5, 70.0, 72.5,
-    75.0, 77.5, 80.0, 82.5, 85.0,
-    87.5, 90.0, 92.5, 95.0, 97.5,
-    100.0
-};
+    65.0, 70.0, 75.0, 80};
 
 static const float freq_MHz[NUM_POINTS] = {
-    5.89807, 5.89984, 5.90123, 5.90786, 5.91271,
-    5.92365, 5.92891, 5.94361, 5.95148, 5.96751,
-    5.98287, 5.99505, 6.01061, 6.03432, 6.04099,
-    6.06224, 6.07113, 6.09508, 6.10909, 6.12351,
-    6.13959, 6.16958, 6.17209, 6.20116, 6.19695,
-    6.21887, 6.25129, 6.24627, 6.29026, 6.30239,
-    6.32946, 6.37288, 6.37561, 6.38429, 6.38255,
-    6.38967, 6.39334, 6.44768, 6.47235, 6.41289,
-    6.31169
-};
+    4.38466, 4.38727, 4.39402, 4.40353, 4.40991,
+    4.41472, 4.42542, 4.42793, 4.43923, 4.45070,
+    4.45593, 4.46924, 4.47470, 4.48383, 4.48852,
+    4.48951, 4.50409, 4.51242, 4.51403, 4.51935,
+    4.52886, 4.53555, 4.54403, 4.5839, 4.61895, 4.63};
 
-// Converts measured frequency in MHz → position_mm using LUT + linear interpolation
-float interpolate_position(float f_meas_MHz)
+// Converts measured frequency → position_mm.
+// check again - wrong position at 100mm and 5, 10mm (combine with linear interpolation?)
+float interpolate_position(float f_meas)
 {
     // Clamping
-    if (f_meas_MHz <= freq_MHz[0])
-        return pos_mm[0];
-    if (f_meas_MHz >= freq_MHz[NUM_POINTS - 1])
-        return pos_mm[NUM_POINTS - 1];
+    //  if (f_meas <= freq_MHz[0])
+    //  {
+    //      ESP_LOGW(TAG, "Target Metal not in linear range");
+    //      return NAN;
+    //  }
+    if (f_meas >= 4.65) // allows for last position at 75mm to be read
+    {
+        ESP_LOGW(TAG, "Target Metal not in linear range");
+        return NAN;
+    }
 
     // Find interval where freq lies
     for (int i = 0; i < NUM_POINTS - 1; i++)
@@ -231,26 +236,47 @@ float interpolate_position(float f_meas_MHz)
         float f1 = freq_MHz[i];
         float f2 = freq_MHz[i + 1];
 
-        if ((f_meas_MHz >= f1 && f_meas_MHz <= f2) ||
-            (f_meas_MHz >= f2 && f_meas_MHz <= f1))
+        if ((f_meas >= f1 && f_meas <= f2) || (f_meas >= f2 && f_meas <= f1))
         {
             float x1 = pos_mm[i];
             float x2 = pos_mm[i + 1];
 
             // Linear interpolation:
             // x = x1 + (f - f1) * (x2 - x1) / (f2 - f1)
-            float position = x1 + (f_meas_MHz - f1) * (x2 - x1) / (f2 - f1);
+            float position = x1 + (f_meas - f1) * (x2 - x1) / (f2 - f1);
             return position;
         }
     }
 
-    // Fallback (should never occur if LUT covers the range)
-    return -1.0f;
+    return NAN;
 }
 
-// ===================== MAIN APP =====================
+#define MA_WINDOW 10
 
-void app_main(void)
+static float freq_buffer[MA_WINDOW] = {0};
+static int freq_index = 0;
+static int freq_count = 0;
+
+// 3-point moving average
+float moving_average_3(float new_sample)
+{
+    freq_buffer[freq_index] = new_sample;
+    freq_index = (freq_index + 1) % MA_WINDOW;
+
+    if (freq_count < MA_WINDOW)
+        freq_count++;
+
+    float sum = 0;
+    for (int i = 0; i < freq_count; i++)
+        sum += freq_buffer[i];
+
+    float avg = sum / freq_count;
+    // ESP_LOGI("AVG", "Freq buffer [%d samples]: avg=%.5f MHz", freq_count, avg);
+
+    return avg;
+}
+
+void app_main()
 {
     esp_log_level_set("*", ESP_LOG_VERBOSE);
     printf("---- BOOTED ----\n");
@@ -266,7 +292,13 @@ void app_main(void)
     }
 
     // Wait for first conversion to complete
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+
+// Calibration constants for Linear interpolation
+#define POS_NEAR_MM 0.0
+#define POS_FAR_MM 100.0
+#define F_NEAR_HZ 5.904 // 0 mm
+#define F_FAR_HZ 6.332  // 10 mm
 
     // --- Main Loop for Reading Channel 1 Data ---
     while (1)
@@ -293,9 +325,10 @@ void app_main(void)
             }
 
             // Combine into 28-bit value (bits 27:0)
+            // MSB contains bits [27:16], LSB contains bits [15:0]
             uint32_t raw28 = (((uint32_t)(msb & 0x0FFF)) << 16) | lsb;
 
-            // Special conditions
+            // Check for special error conditions
             if (raw28 == 0x00000000)
             {
                 ESP_LOGE(TAG, "CH1 Under-range condition detected!");
@@ -305,36 +338,50 @@ void app_main(void)
                 ESP_LOGE(TAG, "CH1 Over-range condition detected!");
             }
 
-            // Calculate frequency using friend's scaling (this yields values ~6.0 which match your LUT in MHz)
-            const double SCALE_FACTOR = pow(2.0, 28.0) * (double)R_COUNT_VALUE;
-            double measured_freq_mhz = ((double)raw28 * CLK_SPEED) / SCALE_FACTOR; // treat as MHz for LUT + display
-            double measured_freq_hz  = measured_freq_mhz * 1e6;                    // derive Hz for physics calcs
+            // Calculate frequency using the formula from datasheet
+            // f_sensor = (DATA × f_CLK) / (RCOUNT × 2^28)
+            // const double SCALE_FACTOR = pow(2.0, 28.0) * (double)R_COUNT_VALUE;
+            // double measured_freq = ((double)raw28 * CLK_SPEED) / SCALE_FACTOR;
 
-            // Calculate change in inductance (using Hz)
-            double delta_L = calc_delta_L(measured_freq_hz, BASE_FREQ, BASE_L_VALUE);
+            // If using internal clock and FREF_DIVIDER1 = 1
 
-            // Calculate absolute inductance using L = 1/(4π²f²C) (f in Hz)
-            double calculated_L = 0.0;
-            if (measured_freq_hz > 0.0)
-            {
-                calculated_L = 1.0 /
-                    (4.0 * M_PI * M_PI * measured_freq_hz * measured_freq_hz * TANK_CAPACITANCE);
-            }
+            const double f_ref1 = CLK_SPEED / 1.0;
+            double measured_freq = ((double)raw28 * f_ref1) / pow(2.0, 28.0);
+            double measured_freq_MHz = measured_freq / 1e6;
+            double measured_freq_ave = moving_average_3(measured_freq_MHz);
+            // Calculate change in inductance
+            // double delta_L = calc_delta_L(measured_freq, BASE_FREQ, BASE_L_VALUE);
 
-            // Look up + Interpolation using MHz (LUT is in MHz)
-            float position_mm = interpolate_position((float)measured_freq_mhz);
+            // // Calculate absolute inductance using L = 1/(4π²f²C)
+            // double calculated_L = 0;
+            // if (measured_freq > 0)
+            // {
+            //     calculated_L = 1.0 / (4.0 * M_PI * M_PI * measured_freq * measured_freq * TANK_CAPACITANCE);
+            // }
 
-            // Debug logs
-            ESP_LOGI(TAG, "Measured Resonant Frequency: %.5f MHz ", measured_freq_mhz);
-            ESP_LOGI(TAG, "Target position: %.3f mm", position_mm);
-            // ESP_LOGI(TAG, "Calculated Inductance: %.6e H (%.3f µH)", calculated_L, calculated_L * 1e6);
-            // ESP_LOGI(TAG, "Change in Inductance (Delta L): %e H", delta_L);
+            float position_mm;
+            // Look up + Interpolation
+            position_mm = interpolate_position(measured_freq_ave);
+            // Linear interpolation between (F_NEAR_HZ, 0 mm) and (F_FAR_HZ, 10 mm) (WORKS)
+            // if (measured_freq <= F_NEAR_HZ)
+            // {
+            //     position_mm = POS_NEAR_MM; // clamp to 0 mm
+            // }
+            // else if (measured_freq >= F_FAR_HZ)
+            // {
+            //     position_mm = POS_FAR_MM; // clamp to 10 mm
+            // }
+            // else
+            // {
+            // double c = -((POS_FAR_MM - POS_NEAR_MM) / (F_FAR_HZ - F_NEAR_HZ)) * (F_NEAR_HZ);
+            // position_mm = ((POS_FAR_MM - POS_NEAR_MM) / (F_FAR_HZ - F_NEAR_HZ)) * (measured_freq) + c;
+            // }
 
-            // ---- JSON OUTPUT for backend/UI ----
-            // One clean JSON line per reading
-            printf("{\"freq_hz\": %.3f, \"freq_mhz\": %.5f, \"pos_mm\": %.3f}\n",
-                   measured_freq_hz, measured_freq_mhz, position_mm);
-            fflush(stdout);
+            // ESP_LOGI(TAG, "CH1 raw: MSB=0x%04X LSB=0x%04X raw28=0x%08X (%u)",msb, lsb, (unsigned int)raw28, (unsigned int)raw28);
+            ESP_LOGI(TAG, "Measured Resonant Frequency: %.5f MHz | Target position: %.3f mm", measured_freq_ave, position_mm);
+            //  ESP_LOGI(TAG, "Calculated Inductance: %.6e H (%.3f µH)", calculated_L, calculated_L * 1e6);
+            //  ESP_LOGI(TAG, "Change in Inductance (Delta L): %e H", delta_L);
+            //  ESP_LOGI(TAG, "----------------------------------------");
         }
         else
         {
@@ -342,7 +389,73 @@ void app_main(void)
                      esp_err_to_name(ret_msb), esp_err_to_name(ret_lsb));
         }
 
-        // Wait for next measurement
-        vTaskDelay(pdMS_TO_TICKS(1000)); // 1 Hz update
+        // Wait for the next measurement
+        // vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+        // freq reading every 0.5s
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
+
+// // Testing if LDC1612 is detected on the I2C bus
+// void app_main()
+// {
+//     i2c_master_init();
+
+//     // Give I2C bus time to stabilize
+//     vTaskDelay(500 / portTICK_PERIOD_MS);
+
+//     ESP_LOGI("SCAN", "Starting I2C scan...");
+//     ESP_LOGI("SCAN", "SDA=GPIO%d, SCL=GPIO%d", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
+
+//     int devices_found = 0;
+
+//     for (int addr = 1; addr < 127; addr++)
+//     {
+//         // Use a proper I2C probe - just send address with no data
+//         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+//         i2c_master_start(cmd);
+//         i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+//         i2c_master_stop(cmd);
+//         esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 100 / portTICK_PERIOD_MS);
+//         i2c_cmd_link_delete(cmd);
+
+//         if (ret == ESP_OK)
+//         {
+//             ESP_LOGW("SCAN", "Found device at address 0x%02X (%d)", addr, addr);
+//             devices_found++;
+//         }
+
+//         vTaskDelay(10 / portTICK_PERIOD_MS); // Small delay between probes
+//     }
+
+//     ESP_LOGI("SCAN", "Scan complete. Found %d device(s).", devices_found);
+
+//     // Also try to read LDC1612 Device ID register (0x7F) at both possible addresses
+//     ESP_LOGI("SCAN", "Attempting to read LDC1612 Device ID...");
+
+//     uint8_t addrs_to_try[] = {0x2A, 0x2B};
+//     for (int i = 0; i < 2; i++)
+//     {
+//         uint8_t addr = addrs_to_try[i];
+//         uint8_t reg = 0x7F; // Device ID register
+//         uint8_t read_buf[2];
+
+//         esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, addr, &reg, 1, read_buf, 2, 500 / portTICK_PERIOD_MS);
+
+//         if (ret == ESP_OK)
+//         {
+//             uint16_t device_id = (read_buf[0] << 8) | read_buf[1];
+//             ESP_LOGW("SCAN", "LDC1612 found at 0x%02X! Device ID: 0x%04X", addr, device_id);
+//         }
+//         else
+//         {
+//             ESP_LOGI("SCAN", "No response at 0x%02X: %s", addr, esp_err_to_name(ret));
+//         }
+//     }
+
+//     while (1)
+//     {
+//         vTaskDelay(1000 / portTICK_PERIOD_MS);
+//     }
+// }
