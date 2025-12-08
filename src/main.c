@@ -23,13 +23,13 @@
 #define I2C_MASTER_SCL_IO 22
 #define I2C_MASTER_SDA_IO 21
 #define I2C_MASTER_NUM I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ 100000
+#define I2C_MASTER_FREQ_HZ 100000 // // Bus speed in Hz
 #define LDC1612_ADDR 0x2B
 
 static const char *TAG = "LDC1612_I2C";
 
 // --- Sensor/Calculation Constants ---
-#define TANK_CAPACITANCE 76e-12
+#define TANK_CAPACITANCE 76e-12 
 #define BASE_FREQ 4708740       // from VNA testing
 #define BASE_L_VALUE 1.3642E-05 // from VNA testing
 #define R_COUNT_VALUE 0xFFFF
@@ -214,16 +214,10 @@ static const float freq_MHz[NUM_POINTS] = {
     4.48951, 4.50409, 4.51242, 4.51403, 4.51935,
     4.52886, 4.53555, 4.54403, 4.5839, 4.61895, 4.63};
 
-// Converts measured frequency → position_mm.
-// check again - wrong position at 100mm and 5, 10mm (combine with linear interpolation?)
+// Converts measured frequency → position_mm
 float interpolate_position(float f_meas)
 {
     // Clamping
-    //  if (f_meas <= freq_MHz[0])
-    //  {
-    //      ESP_LOGW(TAG, "Target Metal not in linear range");
-    //      return NAN;
-    //  }
     if (f_meas >= 4.65) // allows for last position at 75mm to be read
     {
         ESP_LOGW(TAG, "Target Metal not in linear range");
@@ -233,15 +227,16 @@ float interpolate_position(float f_meas)
     // Find interval where freq lies
     for (int i = 0; i < NUM_POINTS - 1; i++)
     {
-        float f1 = freq_MHz[i];
+        float f1 = freq_MHz[i]; // this is the measured frequency during calibration
         float f2 = freq_MHz[i + 1];
 
         if ((f_meas >= f1 && f_meas <= f2) || (f_meas >= f2 && f_meas <= f1))
         {
-            float x1 = pos_mm[i];
+            float x1 = pos_mm[i]; 
             float x2 = pos_mm[i + 1];
 
-            // Linear interpolation:
+            //Linear interpolation: It calculates where f_meas lies proportionally between f1 and f2, then applies that same 
+            // proportion to find the corresponding position between x1 and x2.
             // x = x1 + (f - f1) * (x2 - x1) / (f2 - f1)
             float position = x1 + (f_meas - f1) * (x2 - x1) / (f2 - f1);
             return position;
@@ -257,8 +252,8 @@ static float freq_buffer[MA_WINDOW] = {0};
 static int freq_index = 0;
 static int freq_count = 0;
 
-// 3-point moving average
-float moving_average_3(float new_sample)
+// 10-point moving average
+float moving_average_10(float new_sample)
 {
     freq_buffer[freq_index] = new_sample;
     freq_index = (freq_index + 1) % MA_WINDOW;
@@ -271,8 +266,6 @@ float moving_average_3(float new_sample)
         sum += freq_buffer[i];
 
     float avg = sum / freq_count;
-    // ESP_LOGI("AVG", "Freq buffer [%d samples]: avg=%.5f MHz", freq_count, avg);
-
     return avg;
 }
 
@@ -291,14 +284,8 @@ void app_main()
         return;
     }
 
-    // Wait for first conversion to complete
+    // delay between init and first read
     vTaskDelay(500 / portTICK_PERIOD_MS);
-
-// Calibration constants for Linear interpolation
-#define POS_NEAR_MM 0.0
-#define POS_FAR_MM 100.0
-#define F_NEAR_HZ 5.904 // 0 mm
-#define F_FAR_HZ 6.332  // 10 mm
 
     // --- Main Loop for Reading Channel 1 Data ---
     while (1)
@@ -328,28 +315,25 @@ void app_main()
             // MSB contains bits [27:16], LSB contains bits [15:0]
             uint32_t raw28 = (((uint32_t)(msb & 0x0FFF)) << 16) | lsb;
 
-            // Check for special error conditions
+            // Check for special error conditions for the 28-bit raw value
+            // faster oscillation with increased drive current
             if (raw28 == 0x00000000)
             {
-                ESP_LOGE(TAG, "CH1 Under-range condition detected!");
+                ESP_LOGE(TAG, "CH1 Under-range condition detected!"); // cannot detect the LC oscillation, or the oscillation frequency is far too low
             }
             else if (raw28 == 0x0FFFFFFF)
             {
-                ESP_LOGE(TAG, "CH1 Over-range condition detected!");
+                ESP_LOGE(TAG, "CH1 Over-range condition detected!"); // when the oscillation frequency is too high to measure reliably
             }
 
             // Calculate frequency using the formula from datasheet
-            // f_sensor = (DATA × f_CLK) / (RCOUNT × 2^28)
-            // const double SCALE_FACTOR = pow(2.0, 28.0) * (double)R_COUNT_VALUE;
-            // double measured_freq = ((double)raw28 * CLK_SPEED) / SCALE_FACTOR;
-
-            // If using internal clock and FREF_DIVIDER1 = 1
-
+            // Using internal clock and FREF_DIVIDER1 = 1
             const double f_ref1 = CLK_SPEED / 1.0;
             double measured_freq = ((double)raw28 * f_ref1) / pow(2.0, 28.0);
             double measured_freq_MHz = measured_freq / 1e6;
-            double measured_freq_ave = moving_average_3(measured_freq_MHz);
-            // Calculate change in inductance
+            double measured_freq_ave = moving_average_10(measured_freq_MHz);
+            
+            // // Calculate change in inductance
             // double delta_L = calc_delta_L(measured_freq, BASE_FREQ, BASE_L_VALUE);
 
             // // Calculate absolute inductance using L = 1/(4π²f²C)
@@ -360,8 +344,13 @@ void app_main()
             // }
 
             float position_mm;
-            // Look up + Interpolation
             position_mm = interpolate_position(measured_freq_ave);
+
+            // Calibration constants for Linear interpolation
+            // #define POS_NEAR_MM 0.0
+            // #define POS_FAR_MM 100.0
+            // #define F_NEAR_HZ 5.904 // 0 mm
+            // #define F_FAR_HZ 6.332  // 10 mm
             // Linear interpolation between (F_NEAR_HZ, 0 mm) and (F_FAR_HZ, 10 mm) (WORKS)
             // if (measured_freq <= F_NEAR_HZ)
             // {
@@ -389,73 +378,28 @@ void app_main()
                      esp_err_to_name(ret_msb), esp_err_to_name(ret_lsb));
         }
 
-        // Wait for the next measurement
-        // vTaskDelay(1000 / portTICK_PERIOD_MS);
-
-        // freq reading every 0.5s
+        // delay between readings every 0.5s
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-}
+} 
 
-// // Testing if LDC1612 is detected on the I2C bus
-// void app_main()
-// {
-//     i2c_master_init();
-
-//     // Give I2C bus time to stabilize
-//     vTaskDelay(500 / portTICK_PERIOD_MS);
-
-//     ESP_LOGI("SCAN", "Starting I2C scan...");
-//     ESP_LOGI("SCAN", "SDA=GPIO%d, SCL=GPIO%d", I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
-
-//     int devices_found = 0;
-
-//     for (int addr = 1; addr < 127; addr++)
-//     {
-//         // Use a proper I2C probe - just send address with no data
-//         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-//         i2c_master_start(cmd);
-//         i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-//         i2c_master_stop(cmd);
-//         esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 100 / portTICK_PERIOD_MS);
-//         i2c_cmd_link_delete(cmd);
-
-//         if (ret == ESP_OK)
+// Testing if LDC1612 is detected on the I2C bus 
+// void app_main() 
+// { 
+//     i2c_master_init(); 
+//     ESP_LOGI("SCAN", "Starting I2C scan..."); 
+//     for (int addr = 1; addr < 127; addr++) 
+//     { 
+//         uint8_t dummy = 0; 
+//         esp_err_t ret = i2c_master_write_to_device(I2C_MASTER_NUM, addr, &dummy, 1, 50 / portTICK_PERIOD_MS); 
+//         if (ret == ESP_OK) 
 //         {
-//             ESP_LOGW("SCAN", "Found device at address 0x%02X (%d)", addr, addr);
-//             devices_found++;
-//         }
-
-//         vTaskDelay(10 / portTICK_PERIOD_MS); // Small delay between probes
-//     }
-
-//     ESP_LOGI("SCAN", "Scan complete. Found %d device(s).", devices_found);
-
-//     // Also try to read LDC1612 Device ID register (0x7F) at both possible addresses
-//     ESP_LOGI("SCAN", "Attempting to read LDC1612 Device ID...");
-
-//     uint8_t addrs_to_try[] = {0x2A, 0x2B};
-//     for (int i = 0; i < 2; i++)
-//     {
-//         uint8_t addr = addrs_to_try[i];
-//         uint8_t reg = 0x7F; // Device ID register
-//         uint8_t read_buf[2];
-
-//         esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, addr, &reg, 1, read_buf, 2, 500 / portTICK_PERIOD_MS);
-
-//         if (ret == ESP_OK)
-//         {
-//             uint16_t device_id = (read_buf[0] << 8) | read_buf[1];
-//             ESP_LOGW("SCAN", "LDC1612 found at 0x%02X! Device ID: 0x%04X", addr, device_id);
-//         }
-//         else
-//         {
-//             ESP_LOGI("SCAN", "No response at 0x%02X: %s", addr, esp_err_to_name(ret));
-//         }
-//     }
-
-//     while (1)
-//     {
-//         vTaskDelay(1000 / portTICK_PERIOD_MS);
-//     }
+//             ESP_LOGW("SCAN", "Found device at address 0x%02X", addr); 
+//         } 
+//     } 
+//     ESP_LOGI("SCAN", "Scan complete."); 
+//     while (1) 
+//     { 
+//         vTaskDelay(1000 / portTICK_PERIOD_MS); 
+//     } 
 // }
