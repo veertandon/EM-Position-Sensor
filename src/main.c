@@ -236,7 +236,7 @@ float interpolate_position(float f_meas)
             float x2 = pos_mm[i + 1];
 
             //Linear interpolation: It calculates where f_meas lies proportionally between f1 and f2, then applies that same 
-            // proportion to find the corresponding position between x1 and x2.
+            //proportion to find the corresponding position between x1 and x2.
             // x = x1 + (f - f1) * (x2 - x1) / (f2 - f1)
             float position = x1 + (f_meas - f1) * (x2 - x1) / (f2 - f1);
             return position;
@@ -371,6 +371,16 @@ void app_main()
             //  ESP_LOGI(TAG, "Calculated Inductance: %.6e H (%.3f µH)", calculated_L, calculated_L * 1e6);
             //  ESP_LOGI(TAG, "Change in Inductance (Delta L): %e H", delta_L);
             //  ESP_LOGI(TAG, "----------------------------------------");
+
+            // Output JSON for backend UI
+            if (isnan(position_mm))
+            {
+                printf("{\"freq_hz\": %.3f, \"freq_mhz\": %.5f, \"pos_mm\": null}\n", measured_freq, measured_freq_ave);
+            }
+            else
+            {
+                printf("{\"freq_hz\": %.3f, \"freq_mhz\": %.5f, \"pos_mm\": %.3f}\n", measured_freq, measured_freq_ave, position_mm);
+            }
         }
         else
         {
